@@ -14,7 +14,7 @@ html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;background
 .input{flex:1;padding:10px;border-radius:8px;border:none}
 .btn{padding:10px 14px;border-radius:8px;border:none;background:var(--accent);color:#fff;cursor:pointer}
 .small{background:rgba(255,255,255,0.12)}
-#lobby{position:fixed;left:12px;top:12px;padding:8px;background:var(--ui-bg);border-radius:8px;color:#fff;z-index:120;display:none}
+#lobby{position:fixed;left:12px;top:12px;padding:8px;background:var(--ui-bg);border-radius:8px;color:#fff;z-index:120;display:none;max-width:300px}
 #playersList{max-height:220px;overflow:auto;margin-top:8px}
 #notify{position:fixed;left:50%;top:12px;transform:translateX(-50%);background:rgba(0,0,0,0.6);color:#fff;padding:8px 12px;border-radius:8px;z-index:140;display:none}
 #joystick{position:fixed;left:18px;bottom:18px;width:140px;height:140px;border-radius:70px;background:rgba(0,0,0,0.25);z-index:80;display:none}
@@ -29,7 +29,7 @@ html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;background
 <div id="canvas-container"></div>
 <div id="menu">
  <div class="card">
-  <h2>MiniCraft 3D — Sala P2P (30×30)</h2>
+  <h2>Kikecraft 3D!</h2>
   <div class="row" style="margin-top:8px">
     <input id="nameInput" class="input" placeholder="Tu nombre" />
     <button id="createBtn" class="btn">Crear Sala</button>
@@ -65,6 +65,8 @@ html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;background
 <script>
 // CONFIG
 const WORLD_SIZE = 30;
+const NETWORK_POS_INTERVAL = 100; // ms
+const REMOTE_INTERPOLATION_DELAY = 120; // ms (artificial delay for smoother movement)
 // Networking
 let peer=null, isHost=false, hostConn=null, conns={}, playersMap={}, myId=null, myName='Jugador';
 const statusEl=document.getElementById('status'), roomInfo=document.getElementById('roomInfo');
@@ -75,20 +77,20 @@ let keys={}, stickDir={x:0,y:0};
 const joystick=document.getElementById('joystick'), stick=document.getElementById('stick'), jumpBtn=document.getElementById('jumpBtn');
 const breakBtn=document.getElementById('breakBtn'), placeBtn=document.getElementById('placeBtn');
 // Three.js
-let scene,camera,renderer,localMesh; let remoteMeshes={}; let blocks={};
+let scene,camera,renderer,localMesh; let remotePlayers={}; let blocks={};
 let velocity={x:0,y:0,z:0}, onGround=true; const GRAVITY=-0.028, JUMP=0.45, MOVE_SPEED=0.09;
 let lastTime=performance.now();
 // World state (host authoritative)
-let worldState={}; // key -> {x,y,z,color}
+let worldState={};
 
 // Helpers
 const key = (x,y,z)=>`${x},${y},${z}`;
-function notify(text,ttl=3000){ notifyEl.textContent=text; notifyEl.style.display='block'; setTimeout(()=>{ notifyEl.style.display='none'; }, ttl); }
+function notify(text,ttl=2500){ notifyEl.textContent=text; notifyEl.style.display='block'; setTimeout(()=>{ notifyEl.style.display='none'; }, ttl); }
 
 // UI handlers
 document.getElementById('createBtn').onclick = ()=>{ myName=document.getElementById('nameInput').value||'Host'; initPeer(()=>createRoom()); }
 document.getElementById('joinBtn').onclick = ()=>{ const id=document.getElementById('hostInput').value.trim(); if(!id) return alert('Introduce ID'); myName=document.getElementById('nameInput').value||'Player'; initPeer(()=>joinRoom(id)); }
-document.getElementById('localBtn').onclick = ()=>{ myName=document.getElementById('nameInput').value||'Local'; initPeer(()=>{ isHost=false; playersMap={}; playersMap['local']={id:'local',name:myName,ready:true,x:0,y:1,z:0}; startGame({local:{x:0,y:1,z:0}}, ['local']); }); }
+document.getElementById('localBtn').onclick = ()=>{ myName=document.getElementById('nameInput').value||'Local'; initPeer(()=>{ isHost=false; playersMap={}; playersMap['local']={id:'local',name:myName,ready:true,x:0,y:1,z:0}; buildInitialWorld(); startGame({local:{x:0,y:1,z:0}}, ['local']); }); }
 
 // Peer init
 function initPeer(cb){ if(peer){ try{ peer.destroy(); }catch(e){} peer=null; } peer=new Peer(); peer.on('open',id=>{ myId=id; statusEl.textContent='Peer listo: '+id; roomInfo.textContent='ID: '+id; if(cb) setTimeout(cb,120); }); peer.on('connection',conn=>{ if(isHost) setupHostConn(conn); else { conn.on('open',()=>{ conn.send({type:'busy'}); conn.close(); }); } }); peer.on('error',e=>{ console.error(e); statusEl.textContent='Error de peer'; }); }
@@ -97,18 +99,11 @@ function initPeer(cb){ if(peer){ try{ peer.destroy(); }catch(e){} peer=null; } p
 function createRoom(){ isHost=true; playersMap={}; conns={}; playersMap[myId]={id:myId,name:myName,ready:false,x:0,y:1,z:0}; roomIdText.textContent=myId; lobby.style.display='block'; document.getElementById('menu').style.display='none'; statusEl.textContent='Sala creada: '+myId; roomInfo.textContent='ID: '+myId; buildInitialWorld(); updatePlayersUI(); }
 
 function setupHostConn(conn){ const id=conn.peer; conns[id]=conn; conn.on('open',()=>{ // send full sync
-  conn.send({type:'sync',world:serializeWorld(),players:Object.values(playersMap)}); });
-  conn.on('data',d=>handleHostData(conn,d)); conn.on('close',()=>{ delete conns[id]; delete playersMap[id]; broadcast({type:'players',players:Object.values(playersMap)}); updatePlayersUI(); notify((playersMap[id]?.name||id)+' se ha desconectado',2000); }); }
+  conn.send({type:'sync',world:serializeWorld(),players:Object.values(playersMap)}); }); conn.on('data',d=>handleHostData(conn,d)); conn.on('close',()=>{ notify((playersMap[id]?.name||id)+' se ha desconectado',2000); delete conns[id]; delete playersMap[id]; broadcast({type:'players',players:Object.values(playersMap)}); updatePlayersUI(); }); }
 
-function handleHostData(conn,data){ const id=conn.peer; if(!data||!data.type) return; if(data.type==='intro'){ // client introduced itself
-    playersMap[id]={id,name:data.name,ready:false,x:2,y:1,z:0}; updatePlayersUI(); broadcast({type:'players',players:Object.values(playersMap)}); notify(data.name+' se ha unido a la sala',2500);
-  } else if(data.type==='ready'){ if(playersMap[id]) playersMap[id].ready = !!data.ready; updatePlayersUI(); broadcast({type:'players',players:Object.values(playersMap)}); }
-  else if(data.type==='pos'){ // update and relay
-    if(playersMap[id]){ playersMap[id].x=data.x; playersMap[id].y=data.y; playersMap[id].z=data.z; }
-    // relay to others
-    broadcast(Object.assign({},data,{from:id}), id);
-  } else if(data.type==='block'){ if(data.action==='add'){ worldState[key(data.x,data.y,data.z)]={x:data.x,y:data.y,z:data.z,color:data.color}; addBlockMesh(data.x,data.y,data.z,data.color); } else if(data.action==='remove'){ delete worldState[key(data.x,data.y,data.z)]; removeBlockMesh(data.x,data.y,data.z); } broadcast(data, id); }
-}
+function handleHostData(conn,data){ const id=conn.peer; if(!data||!data.type) return; if(data.type==='intro'){ playersMap[id]={id,name:data.name,ready:false,x:2,y:1,z:0}; updatePlayersUI(); broadcast({type:'players',players:Object.values(playersMap)}); notify(data.name+' se ha unido a la sala',2200); } else if(data.type==='ready'){ if(playersMap[id]) playersMap[id].ready = !!data.ready; updatePlayersUI(); broadcast({type:'players',players:Object.values(playersMap)}); } else if(data.type==='pos'){ if(playersMap[id]){ playersMap[id].x=data.x; playersMap[id].y=data.y; playersMap[id].z=data.z; } // relay to others (attach timestamp from sender)
+    const relay = Object.assign({},data,{from:id}); broadcast(relay, id);
+ } else if(data.type==='block'){ if(data.action==='add'){ worldState[key(data.x,data.y,data.z)]={x:data.x,y:data.y,z:data.z,color:data.color}; addBlockMesh(data.x,data.y,data.z,data.color); } else if(data.action==='remove'){ delete worldState[key(data.x,data.y,data.z)]; removeBlockMesh(data.x,data.y,data.z); } broadcast(data, id); } }
 
 function broadcast(obj,except){ for(let id in conns){ if(id===except) continue; try{ conns[id].send(obj); }catch(e){} } }
 
@@ -116,28 +111,23 @@ function broadcast(obj,except){ for(let id in conns){ if(id===except) continue; 
 function joinRoom(hostId){ const conn = peer.connect(hostId); hostConn=conn; conn.on('open',()=>{ conn.send({type:'intro',name:myName}); statusEl.textContent='Conectado a host '+hostId; roomInfo.textContent='Sala: '+hostId; lobby.style.display='block'; document.getElementById('menu').style.display='none'; }); conn.on('data',d=>handleClientData(d)); conn.on('close',()=>{ statusEl.textContent='Desconectado del host'; notify('Desconectado del host',2000); }); }
 
 function handleClientData(data){ if(!data||!data.type) return; if(data.type==='sync'){ // full sync
-    worldState={}; for(let b of data.world) worldState[key(b.x,b.y,b.z)] = b; buildWorldFromState(); playersMap={}; for(let p of data.players) playersMap[p.id]=p; updatePlayersUI(); }
-  else if(data.type==='players'){ playersMap={}; for(let p of data.players) playersMap[p.id]=p; updatePlayersUI(); }
-  else if(data.type==='start'){ // host started game
-    const spawns = data.spawns || {}; const ids = data.playerIds || Object.keys(playersMap); startGame(spawns, ids); }
-  else if(data.type==='pos'){ const id = data.from || data.id; if(id===myId) return; ensureRemote(id); remoteMeshes[id].target.set(data.x,data.y,data.z); }
-  else if(data.type==='block'){ if(data.action==='add'){ worldState[key(data.x,data.y,data.z)]={x:data.x,y:data.y,z:data.z,color:data.color}; addBlockMesh(data.x,data.y,data.z,data.color);} else if(data.action==='remove'){ delete worldState[key(data.x,data.y,data.z)]; removeBlockMesh(data.x,data.y,data.z);} }
-  else if(data.type==='notify'){ notify(data.text,2500); }
-}
+    worldState={}; for(let b of data.world) worldState[key(b.x,b.y,b.z)] = b; buildWorldFromState(); playersMap={}; for(let p of data.players) playersMap[p.id]=p; updatePlayersUI(); } else if(data.type==='players'){ playersMap={}; for(let p of data.players) playersMap[p.id]=p; updatePlayersUI(); } else if(data.type==='start'){ const spawns = data.spawns || {}; const ids = data.playerIds || Object.keys(playersMap); startGame(spawns, ids); } else if(data.type==='pos'){ // relay from host: contains from and timestamp
+    const id = data.from || data.id; if(id===myId) return; ensureRemote(id); // push sample with timestamp
+    const now = performance.now(); const sampleTime = data.t || now; // if sender included t, use it
+    remotePlayers[id].buffer.push({t:sampleTime, x:data.x, y:data.y, z:data.z}); // keep buffer length reasonable
+    if(remotePlayers[id].buffer.length>20) remotePlayers[id].buffer.shift(); } else if(data.type==='block'){ if(data.action==='add'){ worldState[key(data.x,data.y,data.z)]={x:data.x,y:data.y,z:data.z,color:data.color}; addBlockMesh(data.x,data.y,data.z,data.color);} else if(data.action==='remove'){ delete worldState[key(data.x,data.y,data.z)]; removeBlockMesh(data.x,data.y,data.z);} } else if(data.type==='notify'){ notify(data.text,2200); } }
 
 // Players UI
 function updatePlayersUI(){ playersListEl.innerHTML=''; const arr = Object.values(playersMap); arr.forEach(p=>{ const div = document.createElement('div'); div.textContent = p.name + (p.ready? ' ✔️':''); playersListEl.appendChild(div); }); document.getElementById('hud').style.display = arr.length>0 ? 'block' : 'none'; document.getElementById('hudPlayers').textContent = arr.length; // host visibility
- if(isHost) document.getElementById('startBtn').style.display='inline-block'; else document.getElementById('startBtn').style.display='none'; // enable start only if all ready
- const allReady = arr.length>0 && arr.every(p=>p.ready); document.getElementById('startBtn').disabled = !allReady; document.getElementById('waitingMsg').style.display = allReady ? 'none' : 'block'; }
+ if(isHost) document.getElementById('startBtn').style.display='inline-block'; else document.getElementById('startBtn').style.display='none'; const allReady = arr.length>0 && arr.every(p=>p.ready); document.getElementById('startBtn').disabled = !allReady; document.getElementById('waitingMsg').style.display = allReady ? 'none' : 'block'; }
 
-// Ready button behavior: once pressed it becomes disabled and sends ready
+// Ready button behavior
 const readyBtn=document.getElementById('readyBtn'); readyBtn.addEventListener('click', ()=>{ if(!playersMap[myId]) playersMap[myId] = {id:myId,name:myName,ready:false,x:0,y:1,z:0}; playersMap[myId].ready = true; readyBtn.textContent = 'Listo ✔️'; readyBtn.disabled = true; updatePlayersUI(); if(isHost) broadcast({type:'players',players:Object.values(playersMap)}); else if(hostConn && hostConn.open) hostConn.send({type:'ready',ready:true}); });
 
 // Start button (host)
-document.getElementById('startBtn').addEventListener('click', ()=>{ if(!isHost) return; const arr = Object.values(playersMap); if(arr.some(p=>!p.ready)){ alert('Todos deben estar listos'); return; } // compute spawns circle
- const ids = arr.map(p=>p.id); const spawns = {}; const R=4; ids.forEach((id,i)=>{ const a=(i/ids.length)*Math.PI*2; spawns[id] = {x:Math.round(Math.cos(a)*R), y:1, z:Math.round(Math.sin(a)*R)}; }); // broadcast start
- broadcast({type:'start', spawns:spawns, playerIds:ids}); // host also notify
- handleClientData({type:'start', spawns:spawns, playerIds:ids}); // local start
+document.getElementById('startBtn').addEventListener('click', ()=>{ if(!isHost) return; const arr = Object.values(playersMap); if(arr.some(p=>!p.ready)){ alert('Todos deben estar listos'); return; } const ids = arr.map(p=>p.id); const spawns = {}; const R=4; ids.forEach((id,i)=>{ const a=(i/ids.length)*Math.PI*2; spawns[id] = {x:Math.round(Math.cos(a)*R), y:1, z:Math.round(Math.sin(a)*R)}; }); // broadcast start and include current player list
+ broadcast({type:'start', spawns:spawns, playerIds:ids}); // notify clients too
+ handleClientData({type:'start', spawns:spawns, playerIds:ids}); // host starts locally
  });
 
 // World generation 30x30
@@ -149,27 +139,32 @@ function ensureScene(){ if(scene) return; scene=new THREE.Scene(); scene.backgro
 
 function addBlockMesh(x,y,z,color){ ensureScene(); const k=key(x,y,z); if(blocks[k]) return; const geo=new THREE.BoxGeometry(1,1,1); const mat=new THREE.MeshStandardMaterial({color}); const m=new THREE.Mesh(geo,mat); m.position.set(x, y+0.5, z); scene.add(m); blocks[k]=m; }
 function removeBlockMesh(x,y,z){ const k=key(x,y,z); if(!blocks[k]) return; scene.remove(blocks[k]); delete blocks[k]; }
-function buildWorldFromState(){ ensureScene(); // clear existing
- for(let k in blocks){ scene.remove(blocks[k]); } blocks={}; for(let k in worldState){ const b=worldState[k]; addBlockMesh(b.x,b.y,b.z,b.color); } }
+function buildWorldFromState(){ ensureScene(); for(let k in blocks){ scene.remove(blocks[k]); } blocks={}; for(let k in worldState){ const b=worldState[k]; addBlockMesh(b.x,b.y,b.z,b.color); } }
 
-// Remote representations
-function ensureRemote(id){ if(remoteMeshes[id]) return remoteMeshes[id]; const geom=new THREE.BoxGeometry(0.8,0.9,0.8); const mat=new THREE.MeshStandardMaterial({color:0xff5555}); const mesh=new THREE.Mesh(geom,mat); mesh.position.set(2,1,0); mesh.target=new THREE.Vector3(mesh.position.x,mesh.position.y,mesh.position.z); scene.add(mesh); const sprite=createLabel(playersMap[id]?playersMap[id].name: id.slice(0,6)); sprite.position.set(0,1.2,0); mesh.add(sprite); remoteMeshes[id] = {mesh:mesh,target:mesh.target,label:sprite}; return remoteMeshes[id]; }
+// Remote player structure: {mesh, shadow, label, buffer: [{t,x,y,z}], target (Vector3)}
+function ensureRemote(id){ if(remotePlayers[id]) return remotePlayers[id]; const geom=new THREE.BoxGeometry(0.8,0.9,0.8); const mat=new THREE.MeshStandardMaterial({color:0xff5555}); const mesh=new THREE.Mesh(geom,mat); mesh.position.set(2,1,0); scene.add(mesh); // shadow
+ const shadow = createShadow(); scene.add(shadow); // label
+ const sprite=createLabel(playersMap[id]?playersMap[id].name: id.slice(0,6)); sprite.position.set(0,1.2,0); mesh.add(sprite); const rp = {mesh,shadow,label:sprite,buffer:[],target:new THREE.Vector3(mesh.position.x,mesh.position.y,mesh.position.z)}; remotePlayers[id]=rp; return rp; }
 
 function createLabel(text){ const c=document.createElement('canvas'); c.width=256; c.height=64; const ctx=c.getContext('2d'); ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(0,0,c.width,c.height); ctx.fillStyle='white'; ctx.font='28px Arial'; ctx.textAlign='center'; ctx.fillText(text, c.width/2, 40); const tex=new THREE.CanvasTexture(c); const mat=new THREE.SpriteMaterial({map:tex}); const s=new THREE.Sprite(mat); s.scale.set(1.6,0.4,1); return s; }
+
+function createShadow(){ const geo=new THREE.PlaneGeometry(0.9,0.5); const mat=new THREE.MeshBasicMaterial({color:0x000000,transparent:true,opacity:0.35}); const m=new THREE.Mesh(geo,mat); m.rotation.x=-Math.PI/2; m.position.y=0.01; return m; }
 
 // Game start
 function startGame(spawns, playerIds){ ensureScene(); buildWorldFromState(); // ground plane
  const planeGeo=new THREE.PlaneGeometry(WORLD_SIZE+10, WORLD_SIZE+10); const planeMat=new THREE.MeshStandardMaterial({color:0x228b22}); const plane=new THREE.Mesh(planeGeo, planeMat); plane.rotation.x=-Math.PI/2; plane.position.y=0; scene.add(plane);
  // create local
  const geom=new THREE.BoxGeometry(0.8,0.9,0.8); const mat=new THREE.MeshStandardMaterial({color:0x1abc9c}); localMesh=new THREE.Mesh(geom,mat); const spawn = (spawns && spawns[myId]) ? spawns[myId] : {x:0,y:1,z:0}; localMesh.position.set(spawn.x,spawn.y,spawn.z); scene.add(localMesh);
- // create remote
- for(let id of (playerIds || Object.keys(playersMap))){ if(id===myId) continue; if(playersMap[id]) ensureRemote(id); const s = (spawns && spawns[id])?spawns[id]:(playersMap[id]||{}); if(remoteMeshes[id]){ remoteMeshes[id].mesh.position.set(s.x||2,s.y||1,s.z||0); remoteMeshes[id].target.set(s.x||2,s.y||1,s.z||0); } }
+ // local shadow and label
+ const localShadow = createShadow(); scene.add(localShadow); localMesh._shadow = localShadow; const localLabel = createLabel(playersMap[myId]?playersMap[myId].name:'Tú'); localLabel.position.set(0,1.2,0); localMesh.add(localLabel);
+ // create remote players
+ for(let id of (playerIds || Object.keys(playersMap))){ if(id===myId) continue; if(playersMap[id]) ensureRemote(id); const s = (spawns && spawns[id])?spawns[id]:playersMap[id]; if(remotePlayers[id]){ remotePlayers[id].mesh.position.set(s.x||2,s.y||1,s.z||0); remotePlayers[id].target.set(s.x||2,s.y||1,s.z||0); remotePlayers[id].shadow.position.set(s.x||2,0.01,s.z||0); } }
  document.getElementById('menu').style.display='none'; lobby.style.display='none'; document.getElementById('hud').style.display='block'; showControls(); animate(); startPosSender(); }
 
 // Controls UI
 function showControls(){ if('ontouchstart' in window || navigator.maxTouchPoints>0){ joystick.style.display='block'; jumpBtn.style.display='block'; document.getElementById('actionBtns').style.display='block'; } else { joystick.style.display='none'; jumpBtn.style.display='none'; document.getElementById('actionBtns').style.display='none'; } }
 
-// Joystick implementation
+// Joystick
 let dragging=false, origin={x:0,y:0}; joystick.addEventListener('pointerdown',(e)=>{ dragging=true; joystick.setPointerCapture(e.pointerId); const r=joystick.getBoundingClientRect(); origin={x:r.left+r.width/2,y:r.top+r.height/2}; updateStick(e.clientX,e.clientY); }); window.addEventListener('pointermove',(e)=>{ if(!dragging) return; updateStick(e.clientX,e.clientY); }); window.addEventListener('pointerup',(e)=>{ if(!dragging) return; dragging=false; stick.style.transform='translate(-50%,-50%)'; stickDir.x=0; stickDir.y=0; }); function updateStick(cx,cy){ const dx=cx-origin.x; const dy=cy-origin.y; const max=50; const dist=Math.min(max,Math.hypot(dx,dy)); const nx = dist===0?0:dx/dist; const ny = dist===0?0:dy/dist; stick.style.transform=`translate(calc(-50% + ${nx*dist}px), calc(-50% + ${ny*dist}px))`; stickDir.x = (dx/max); stickDir.y = (dy/max); if(Math.abs(stickDir.x)>1) stickDir.x = Math.sign(stickDir.x); if(Math.abs(stickDir.y)>1) stickDir.y = Math.sign(stickDir.y); }
 
 // Keyboard
@@ -177,39 +172,56 @@ window.addEventListener('keydown', e=>{ keys[e.key.toLowerCase()] = true; if(e.c
 jumpBtn.addEventListener('pointerdown', ()=> tryJump()); breakBtn.addEventListener('pointerdown', ()=> performBreak()); placeBtn.addEventListener('pointerdown', ()=> performPlace());
 
 // Movement loop
-function animate(){ requestAnimationFrame(animate); if(!localMesh) return; const now=performance.now(); const dt=Math.min(50,now-lastTime)/16.666; lastTime=now; let mvX=0,mvZ=0; if(keys['a']||keys['arrowleft']) mvX -=1; if(keys['d']||keys['arrowright']) mvX +=1; if(keys['w']||keys['arrowup']) mvZ -=1; if(keys['s']||keys['arrowdown']) mvZ +=1; mvX += stickDir.x; mvZ += -stickDir.y; if(mvX!==0 && mvZ!==0){ const inv=1/Math.sqrt(2); mvX*=inv; mvZ*=inv; } localMesh.position.x += mvX * MOVE_SPEED * dt * 1.5; localMesh.position.z += mvZ * MOVE_SPEED * dt * 1.5; velocity.y += GRAVITY * dt; localMesh.position.y += velocity.y * dt; if(localMesh.position.y <= 1.0){ localMesh.position.y = 1.0; velocity.y = 0; onGround=true; } else onGround=false; camera.position.lerp(new THREE.Vector3(localMesh.position.x, localMesh.position.y+2.5, localMesh.position.z+5), 0.12); camera.lookAt(localMesh.position.x, localMesh.position.y, localMesh.position.z); for(let id in remoteMeshes){ const r=remoteMeshes[id]; r.mesh.position.lerp(r.target,0.12); } renderer.render(scene,camera); }
+function animate(){ requestAnimationFrame(animate); if(!localMesh) return; const now=performance.now(); const dt=Math.min(50,now-lastTime)/16.666; lastTime=now; let mvX=0,mvZ=0; if(keys['a']||keys['arrowleft']) mvX -=1; if(keys['d']||keys['arrowright']) mvX +=1; if(keys['w']||keys['arrowup']) mvZ -=1; if(keys['s']||keys['arrowdown']) mvZ +=1; mvX += stickDir.x; mvZ += -stickDir.y; if(mvX!==0 && mvZ!==0){ const inv=1/Math.sqrt(2); mvX*=inv; mvZ*=inv; } localMesh.position.x += mvX * MOVE_SPEED * dt * 1.5; localMesh.position.z += mvZ * MOVE_SPEED * dt * 1.5; velocity.y += GRAVITY * dt; localMesh.position.y += velocity.y * dt; if(localMesh.position.y <= 1.0){ localMesh.position.y = 1.0; velocity.y = 0; onGround=true; } else onGround=false; // update local shadow
+ if(localMesh._shadow) localMesh._shadow.position.set(localMesh.position.x,0.01,localMesh.position.z);
+ // camera follow
+ camera.position.lerp(new THREE.Vector3(localMesh.position.x, localMesh.position.y+2.5, localMesh.position.z+5), 0.12); camera.lookAt(localMesh.position.x, localMesh.position.y, localMesh.position.z);
+ // update remotes by interpolating from buffered samples using delayed timeline
+ const renderTime = performance.now() - REMOTE_INTERPOLATION_DELAY;
+ for(let id in remotePlayers){ const rp = remotePlayers[id]; // advance based on buffer
+   const buf = rp.buffer; // buffer contains samples {t,x,y,z}
+   if(buf.length===0) continue;
+   // remove old samples
+   while(buf.length>=2 && buf[1].t <= renderTime) buf.shift();
+   if(buf.length===1){ // just move towards it
+     rp.target.set(buf[0].x, buf[0].y, buf[0].z);
+   } else if(buf.length>=2){ const a = buf[0], b = buf[1]; const span = b.t - a.t; const alpha = span>0 ? (renderTime - a.t) / span : 0; const ix = a.x + (b.x - a.x) * alpha; const iy = a.y + (b.y - a.y) * alpha; const iz = a.z + (b.z - a.z) * alpha; rp.target.set(ix, iy, iz); }
+   // smooth lerp towards target
+   rp.mesh.position.lerp(rp.target, 0.12);
+   // update shadow
+   if(rp.shadow) rp.shadow.position.set(rp.mesh.position.x, 0.01, rp.mesh.position.z);
+ }
+ renderer.render(scene,camera);
+}
 
 // Position sender
-let posInterval=null; function startPosSender(){ if(posInterval) clearInterval(posInterval); posInterval=setInterval(()=>{ if(!localMesh) return; const p={type:'pos',x:localMesh.position.x,y:localMesh.position.y,z:localMesh.position.z}; if(isHost){ // host broadcasts its own pos to others
-   playersMap[myId].x=p.x; playersMap[myId].y=p.y; playersMap[myId].z=p.z; broadcast(Object.assign({},p,{from:myId})); } else if(hostConn && hostConn.open){ try{ hostConn.send(p); }catch(e){} } }, 120); }
+let posInterval=null; function startPosSender(){ if(posInterval) clearInterval(posInterval); posInterval=setInterval(()=>{ if(!localMesh) return; const now=performance.now(); const p={type:'pos',x:localMesh.position.x,y:localMesh.position.y,z:localMesh.position.z,t:now}; if(isHost){ // host updates its entry and broadcasts
+   if(playersMap[myId]){ playersMap[myId].x=p.x; playersMap[myId].y=p.y; playersMap[myId].z=p.z; }
+   // broadcast to clients
+   broadcast(Object.assign({},p,{from:myId}));
+ } else if(hostConn && hostConn.open){ try{ hostConn.send(p);}catch(e){} } }, NETWORK_POS_INTERVAL); }
 
 // Jump
-function tryJump(){ if(onGround){ velocity.y = JUMP; onGround=false; // notify position change
- if(isHost){ playersMap[myId].y += JUMP; broadcast({type:'pos',from:myId,x:localMesh.position.x,y:localMesh.position.y,z:localMesh.position.z}); } else if(hostConn && hostConn.open) hostConn.send({type:'pos',x:localMesh.position.x,y:localMesh.position.y,z:localMesh.position.z}); } }
+function tryJump(){ if(onGround){ velocity.y = JUMP; onGround=false; // notify immediately
+   const now=performance.now(); if(isHost){ if(playersMap[myId]) playersMap[myId].y += JUMP; broadcast({type:'pos',from:myId,x:localMesh.position.x,y:localMesh.position.y,z:localMesh.position.z,t:now}); } else if(hostConn && hostConn.open){ hostConn.send({type:'pos',x:localMesh.position.x,y:localMesh.position.y,z:localMesh.position.z,t:now}); } } }
 
 // Break / Place
 function performBreak(){ const dir=new THREE.Vector3(); camera.getWorldDirection(dir); const origin = localMesh.position.clone(); for(let i=1;i<6;i++){ const tx=Math.round(origin.x + dir.x*i); const ty=Math.round(origin.y + dir.y*i)-1; const tz=Math.round(origin.z + dir.z*i); const kkey=key(tx,ty,tz); if(worldState[kkey]){ if(isHost){ delete worldState[kkey]; removeBlockMesh(tx,ty,tz); broadcast({type:'block',action:'remove',x:tx,y:ty,z:tz}); } else if(hostConn && hostConn.open){ hostConn.send({type:'block',action:'remove',x:tx,y:ty,z:tz}); } break; } } }
 function performPlace(){ const dir=new THREE.Vector3(); camera.getWorldDirection(dir); const origin = localMesh.position.clone(); for(let i=1;i<6;i++){ const tx=Math.round(origin.x + dir.x*i); const ty=Math.round(origin.y + dir.y*i)-1; const tz=Math.round(origin.z + dir.z*i); const kkey=key(tx,ty,tz); if(!worldState[kkey]){ const color = Math.floor(Math.random()*0xffffff); worldState[kkey]={x:tx,y:ty,z:tz,color:color}; addBlockMesh(tx,ty,tz,color); if(isHost){ broadcast({type:'block',action:'add',x:tx,y:ty,z:tz,color:color}); } else if(hostConn && hostConn.open){ hostConn.send({type:'block',action:'add',x:tx,y:ty,z:tz,color:color}); } break; } } }
 
 // build world
-function buildWorldFromState(){ ensureScene(); // clear existing
- for(let k in blocks){ scene.remove(blocks[k]); } blocks={}; for(let k in worldState){ const b=worldState[k]; addBlockMesh(b.x,b.y,b.z,b.color); } }
+function buildWorldFromState(){ ensureScene(); for(let k in blocks){ scene.remove(blocks[k]); } blocks={}; for(let k in worldState){ const b=worldState[k]; addBlockMesh(b.x,b.y,b.z,b.color); } }
 
 // Utility: map players array -> map
 function mapPlayers(arr){ const m={}; for(let p of arr) m[p.id]=p; return m; }
 
-// When host sends start, clients receive and startGame; host already calls startGame locally
+// ensure remote creation when playersMap updates
+function syncRemotes(){ for(let id in playersMap){ if(id===myId) continue; if(!remotePlayers[id]) ensureRemote(id); } }
+// patch updatePlayersUI to call syncRemotes
+const origUpdatePlayersUI = updatePlayersUI; window.updatePlayersUI = function(){ origUpdatePlayersUI(); syncRemotes(); };
 
-// Notify helpers already implemented
-
-// Ensure remote meshes created when playersMap updated
-function syncRemotes(){ for(let id in playersMap){ if(id===myId) continue; ensureRemote(id); } }
-
-// When playersMap changes, we should update remotes
-const origUpdatePlayersUI = updatePlayersUI; // small hack to ensure remotes
-window.updatePlayersUI = function(){ origUpdatePlayersUI(); syncRemotes(); };
-
-// Clean up on unload
+// start pos sender for host even if host started before clients
+// clean up on unload
 window.addEventListener('beforeunload', ()=>{ if(posInterval) clearInterval(posInterval); if(hostConn && hostConn.open) hostConn.close(); for(let id in conns){ try{ conns[id].close(); }catch(e){} } if(peer) try{ peer.destroy(); }catch(e){} });
 
 </script>
